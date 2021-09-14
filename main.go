@@ -5,19 +5,16 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"log/syslog"
 	"net"
-	"net/http"
-	"net/url"
-	"regexp"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	_ "github.com/breml/rootcerts"
+	"github.com/mmcdole/gofeed"
 	"golang.org/x/time/rate"
 	"gopkg.in/irc.v3"
 )
@@ -25,18 +22,19 @@ import (
 var messageBeat chan bool
 var firstMessage chan bool
 var client *irc.Client
-var safeLock sync.Mutex
 var messageLimit = rate.NewLimiter(1, 3)
 
 var (
-	doneURLs = make(map[string]time.Time)
+	feedURL = flag.String("feed", "", "the url to the feed")
+	channel = flag.String("channel", "", "channel")
 )
 
 func main() {
 	nick := flag.String("nick", "", "the ircnick you want")
 	from := flag.String("ip", "[::1]", "src address")
 	server := flag.String("ircserver", "", "server")
-	channel := flag.String("channel", "", "channel")
+	nsuser := flag.String("nickservuser", "", "NICKSERV username")
+	nspass := flag.String("nickservpasswd", "", "NICKSERV password")
 	flag.Parse()
 
 	if *nick == "" || *server == "" || *channel == "" {
@@ -90,33 +88,26 @@ func main() {
 				seenMsgBefore = true
 			}
 
+			if m.Command == "366" {
+				log.Printf("started polling RSS")
+				go lookForUpdates()
+			}
+
 			if m.Command == "001" {
 				// 001 is a welcome event, so we join channels there
-				// c.Write("PRIVMSG NickServ :IDENTIFY aaaa bbbb")
-				c.Write(fmt.Sprintf("JOIN %s", *channel))
+				if *nsuser != "" {
+					c.Write(fmt.Sprintf("PRIVMSG NickServ :IDENTIFY %s %s", *nsuser, *nspass))
+				} else {
+					c.Write(fmt.Sprintf("JOIN %s", *channel))
+				}
 			} else if m.Command == "PRIVMSG" && c.FromChannel(m) {
 				// Create a handler on all messages.
-				w := strings.Split(m.Param(1), " ")
-
-				for _, v := range w {
-					_, err := url.Parse(v)
-					if err == nil {
-						// we have a URL!
-						urlTitle := getURLTitle(v)
-						if urlTitle != "" {
-							if messageLimit.Allow() {
-								client.WriteMessage(&irc.Message{
-									Command: "PRIVMSG",
-									Params: []string{
-										*channel,
-										urlTitle,
-									},
-								})
-							}
-						}
+			} else if m.Command == "NOTICE" {
+				if *nsuser != "" {
+					if strings.ToLower(m.Params[0]) == *nick {
+						c.Write(fmt.Sprintf("JOIN %s", *channel))
 					}
 				}
-			} else if m.Command == "NOTICE" {
 				// if strings.ToLower(m.Params[0]) == "chill-urls" {
 				// c.Write("JOIN ##asdasd")
 				// }
@@ -137,68 +128,65 @@ func main() {
 	}
 }
 
-func getURLTitle(in string) string {
-	if !doneURLs[in].IsZero() {
-		if time.Since(doneURLs[in]) < time.Hour {
-			return ""
-		}
-	}
-	doneURLs[in] = time.Now()
-
-	hc := http.Client{}
-	headreq, err := hc.Head(in)
+func loadLastKnownPost() int64 {
+	b, err := ioutil.ReadFile("./last-known-post")
 	if err != nil {
-		log.Printf("failed to get link %v", err)
-		return ""
-	}
-	if strings.Contains(headreq.Header.Get("content-type"), "html") {
-		return getHTMLTitle(in)
+		return 0
 	}
 
-	return fmt.Sprintf("%s: %s [%d kb]", headreq.Request.URL.Host, headreq.Header.Get("content-type"), headreq.ContentLength/1024)
+	i, err := strconv.ParseInt(string(b), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return i
 }
 
-func getHTMLTitle(in string) string {
-	rr, err := http.NewRequest("GET", in, nil)
+func saveNewLastKnownPost(in int64) {
+	ioutil.WriteFile("./last-known-post", []byte(fmt.Sprintf("%d", in)), 0660)
+}
 
-	if strings.Contains(in, "youtube.com") {
-		// rr.Header.Set("User-Agent", "curl/7.68.0")
-		rr.Header.Set("User-Agent", "please just show the title")
-		rr.Header.Set("Accept", "*/*")
+func lookForUpdates() {
+	lastKnownPost := loadLastKnownPost()
+	n := 1
+	for {
+		time.Sleep(time.Second * time.Duration(n))
+		n++
+		if n == 60 {
+			n = 59
+		}
+		fp := gofeed.NewParser()
+		fp.UserAgent = "github.com/benjojo/dumb-rss-to-irc"
+		feed, err := fp.ParseURL(*feedURL)
+		if err != nil {
+			log.Printf("failed to handle RSS error %v", err)
+			// handle error
+			continue
+		}
+
+		for i := len(feed.Items) - 1; i != -1; i-- {
+			v := feed.Items[i]
+			if v.PublishedParsed.Unix() > lastKnownPost {
+				client.WriteMessage(&irc.Message{
+					Command: "PRIVMSG",
+					Params:  []string{*channel, figureOutTitle(v)},
+				})
+				n = 1
+				saveNewLastKnownPost(v.PublishedParsed.Unix())
+				lastKnownPost = v.PublishedParsed.Unix()
+				time.Sleep(time.Second)
+				log.Printf("posted %v", figureOutTitle(v))
+			}
+		}
+		log.Printf("Fetched RSS feed, got %d items", len(feed.Items))
+	}
+}
+
+func figureOutTitle(in *gofeed.Item) string {
+	if len(in.Description) < 500 {
+		return strings.Replace(strings.Replace(in.Description, "\n", "", 0), "\r", "", 0)
 	}
 
-	if strings.Contains(in, "twitter.com") {
-		in = strings.Replace(in, "twitter.com/", "nitter.eu/", 1)
-		rr, err = http.NewRequest("GET", in, nil)
-
-	}
-
-	hc := http.Client{}
-	req, err := hc.Do(rr)
-	if err != nil {
-		log.Printf("failed to get link %v", err)
-		return ""
-	}
-
-	jttr := io.LimitReader(req.Body, 256000)
-	justTheTip, err := ioutil.ReadAll(jttr)
-
-	re := regexp.MustCompile(`<title.*?>(.*)</title>`) //
-	if strings.Contains(in, "youtube.com") {
-		re = regexp.MustCompile(`,"title":{"simpleText":"(.*)"},"description":{"s`) // <title.*?>(.*)</title>
-	}
-
-	// if strings.Contains(string(justTheTip), "mosquitoes") {
-	// 	// panic("yo")
-	// }
-	// fmt.Printf(string(justTheTip))
-	submatchall := re.FindAllStringSubmatch(string(justTheTip), -1)
-	for _, element := range submatchall {
-		return strings.Trim(fmt.Sprintf("%s: %s", req.Request.URL.Host, element[1]), "\r\n \t")
-	}
-
-	log.Printf("failed to find a html tag: ")
-	return ""
+	return strings.Replace(strings.Replace(in.Title, "\n", "", 0), "\r", "", 0)
 }
 
 func ircKeepalive() {
