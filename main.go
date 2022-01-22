@@ -25,8 +25,9 @@ var client *irc.Client
 var messageLimit = rate.NewLimiter(1, 3)
 
 var (
-	feedURL = flag.String("feed", "", "the url to the feed")
-	channel = flag.String("channel", "", "channel")
+	feedURL     = flag.String("feed", "", "the url to the feed")
+	channel     = flag.String("channel", "", "channel")
+	postLinkToo = flag.Bool("post-link", false, "Ensure the link is always posted too")
 )
 
 func main() {
@@ -170,6 +171,14 @@ func lookForUpdates() {
 					Command: "PRIVMSG",
 					Params:  []string{*channel, figureOutTitle(v)},
 				})
+				if *postLinkToo {
+					if !strings.Contains(figureOutTitle(v), "://") {
+						client.WriteMessage(&irc.Message{
+							Command: "PRIVMSG",
+							Params:  []string{*channel, fmt.Sprintf("%v", v.Link)},
+						})
+					}
+				}
 				n = 1
 				saveNewLastKnownPost(v.PublishedParsed.Unix())
 				lastKnownPost = v.PublishedParsed.Unix()
@@ -183,10 +192,17 @@ func lookForUpdates() {
 
 func figureOutTitle(in *gofeed.Item) string {
 	if len(in.Description) < 500 {
-		return strings.Replace(strings.Replace(in.Description, "\n", "", 0), "\r", "", 0)
+		if *postLinkToo {
+			return fmt.Sprintf("%s - %s", strings.Replace(strings.Replace(in.Description, "\n", "", 0), "\r", "", 0), in.Link)
+		}
+		return fmt.Sprintf("%s", strings.Replace(strings.Replace(in.Description, "\n", "", 0), "\r", "", 0))
 	}
 
-	return strings.Replace(strings.Replace(in.Title, "\n", "", 0), "\r", "", 0)
+	if *postLinkToo {
+		return fmt.Sprintf("%s - %s", strings.Replace(strings.Replace(in.Title, "\n", "", 0), "\r", "", 0), in.Link)
+	}
+	return fmt.Sprintf("%s", strings.Replace(strings.Replace(in.Title, "\n", "", 0), "\r", "", 0))
+
 }
 
 func ircKeepalive() {

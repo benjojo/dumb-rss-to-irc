@@ -4,7 +4,6 @@ dumb-rss-to-irc
 Does what it says on the tin, in a mostly "dumb" and unfeatureful way
 
 ```
-$ ./dumb-rss-to-irc -h
 Usage of ./dumb-rss-to-irc:
   -channel string
         channel
@@ -20,6 +19,8 @@ Usage of ./dumb-rss-to-irc:
         NICKSERV password
   -nickservuser string
         NICKSERV username
+  -post-link
+        Ensure the link is always posted too
 ```
 
 tested against a honk instance
